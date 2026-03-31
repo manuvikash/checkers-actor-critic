@@ -13,7 +13,29 @@ import numpy as np
 import torch
 
 from myagent import SelfPlayActorCritic
-from mycheckersenv import env
+from mycheckersenv import BOARD_SIZE, NUM_CELLS, env
+
+
+def load_checkpoint(path: str, learner: SelfPlayActorCritic) -> None:
+    """Load weights from ``torch.save`` output (dict with ``model``) or a raw state_dict."""
+    try:
+        ckpt = torch.load(path, map_location=learner.device, weights_only=False)
+    except TypeError:
+        ckpt = torch.load(path, map_location=learner.device)
+    if isinstance(ckpt, dict) and "model" in ckpt:
+        learner.load_state_dict(ckpt["model"])
+    else:
+        learner.load_state_dict(ckpt)
+    print(f"Loaded weights from {path}")
+
+
+def format_action_move(action: int) -> str:
+    """Decode env action index into from/to board coordinates (row, col)."""
+    fr = action // NUM_CELLS
+    to = action % NUM_CELLS
+    r0, c0 = divmod(fr, BOARD_SIZE)
+    r1, c1 = divmod(to, BOARD_SIZE)
+    return f"({r0},{c0}) → ({r1},{c1})"
 
 
 def play_episode(
@@ -48,7 +70,8 @@ def play_episode(
 
         if render and environment.unwrapped.board is not None:
             print(environment.unwrapped._render_ansi())
-            print(f"  {agent} -> action {action}\n")
+            move = format_action_move(action)
+            print(f"  {agent} -> {move}  (action_id={action})\n")
 
         obs_store.append(obs)
         act_store.append(action)
@@ -56,6 +79,8 @@ def play_episode(
         prev = float(environment._cumulative_rewards[agent])
         environment.step(action)
         post = float(environment._cumulative_rewards[agent])
+        if render:
+            print(f"    step_reward={post - prev:.4f}  cumulative_reward[{agent}]={post:.3f}\n")
         rew_store.append(post - prev)
         done_store.append(False)
 
@@ -96,7 +121,18 @@ def main(argv: List[str] | None = None) -> None:
     )
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--save", type=str, default="checkers_ac.pt")
+    p.add_argument(
+        "--load",
+        type=str,
+        default=None,
+        help="Path to a .pt file from this runner (loads 'model' weights before running)",
+    )
     p.add_argument("--demo", action="store_true", help="Print board each step (one episode)")
+    p.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Greedy actions (argmax); useful with --demo --load",
+    )
     p.add_argument(
         "--eval-episodes",
         type=int,
@@ -110,6 +146,9 @@ def main(argv: List[str] | None = None) -> None:
     torch.manual_seed(args.seed)
 
     learner = SelfPlayActorCritic(gamma=args.gamma, lr=args.lr)
+    if args.load:
+        load_checkpoint(args.load, learner)
+
     opponent: SelfPlayActorCritic | None = None
     if args.snapshot_interval > 0:
         opponent = SelfPlayActorCritic(gamma=args.gamma, lr=args.lr)
@@ -125,17 +164,18 @@ def main(argv: List[str] | None = None) -> None:
     for ep in range(total_eps):
         base_kwargs["render_mode"] = "ansi" if args.demo else None
         e = env(**base_kwargs)
+        demo_eval_only = args.demo and args.load
         observations, actions, rewards, dones, cum = play_episode(
             e,
             learner,
             opponent,
             mix_prev=args.mix_prev,
-            deterministic=False,
+            deterministic=args.deterministic,
             render=args.demo,
         )
         e.close()
 
-        if len(observations) > 0:
+        if len(observations) > 0 and not demo_eval_only:
             stats = learner.update_on_episode(observations, actions, rewards, dones)
         else:
             stats = {"loss": 0.0, "entropy": 0.0, "mean_return": 0.0}
@@ -153,11 +193,26 @@ def main(argv: List[str] | None = None) -> None:
             print(
                 f"ep {ep+1}/{args.episodes} "
                 f"loss={stats['loss']:.4f} ent={stats['entropy']:.3f} "
-                f"cum_p0={p0:.3f} cum_p1={p1:.3f} mean_ret={stats.get('mean_return', 0):.3f}"
+                f"cumulative_reward player_0={p0:.3f} player_1={p1:.3f} "
+                f"mean_ep_return={stats.get('mean_return', 0):.3f}"
             )
 
-    torch.save(dict(model=learner.state_dict(), args=vars(args)), args.save)
-    print(f"Saved {args.save}")
+        if args.demo:
+            p0 = cum.get("player_0", 0.0)
+            p1 = cum.get("player_1", 0.0)
+            print(
+                "Final cumulative rewards (PettingZoo `last()` / `_cumulative_rewards`): "
+                f"player_0={p0:.3f}, player_1={p1:.3f}"
+            )
+
+    if args.demo and args.load:
+        print(
+            "Skipping save (--demo with --load: eval only). "
+            "Omit --load on --demo for one training step, or train without --demo to save."
+        )
+    else:
+        torch.save(dict(model=learner.state_dict(), args=vars(args)), args.save)
+        print(f"Saved {args.save}")
 
     if args.eval_episodes > 0:
         wins = [0, 0, 0]
